@@ -158,7 +158,7 @@ class ProcessSetMonitor:
 
     KEYS = sorted(BASE_STAT.keys())
 
-    def __init__(self, keywords, pids, outfile_name, flush=False):
+    def __init__(self, keywords, exclude, pids, outfile_name, flush=False):
         print('ProcessSet monitor started.', file=sys.stderr)
         if outfile_name is None:
             self.outfile = sys.stdout
@@ -166,8 +166,9 @@ class ProcessSetMonitor:
             self.outfile = open(outfile_name, 'w')
         self.pids = pids
         self.keywords = keywords
+        self.exclude = exclude
         self.flush = flush
-        self.outfile.write('Timestamp, Uptime, ' + ', '.join(self.KEYS) + '\n')
+        self.outfile.write('timestamp,uptime,' + ','.join(self.KEYS) + ',' + 'cmdline' + '\n')
         self.starttime = int(time.time())
         self.poll_stat()
 
@@ -208,35 +209,43 @@ class ProcessSetMonitor:
         for c in proc.children():
             self._stat_proc(c, stat, visited)
 
-    def poll_stat(self):
-        visited = set()
-        curr_stat = dict(self.BASE_STAT)
-        timestamp = int(time.time())
+    def output_stat(self, curr_stat, timestamp, cmdline):
         uptime = timestamp - self.starttime
-        for proc in psutil.process_iter():
-            try:
-                pinfo = proc.as_dict(attrs=['pid', 'name'])
-            except psutil.NoSuchProcess:
-                pass
-            else:
-                if pinfo['pid'] not in visited:
-                    if pinfo['pid'] in self.pids:
-                        self._stat_proc(proc, curr_stat, visited)
-                    else:
-                        for k in self.keywords:
-                            if k in pinfo['name'].lower():
-                                self._stat_proc(proc, curr_stat, visited)
-                                break  # for keyword
         curr_stat['%CPU'] = round(curr_stat['%CPU'], 3)
         curr_stat['%MEM'] = round(curr_stat['%MEM'], 3)
         curr_stat['io.read.KB'] >>= 10
         curr_stat['io.write.KB'] >>= 10
         curr_stat['mem.rss.KB'] >>= 10
-        line = str(timestamp) + ', ' + str(uptime) + ', ' + \
-            ', '.join([str(curr_stat[k]) for k in self.KEYS]) + '\n'
+
+        line = str(timestamp) + ',' + str(uptime) + ',' + \
+               ','.join([str(curr_stat[k]) for k in self.KEYS]) + ',' + cmdline + '\n'
         self.outfile.write(line)
         if self.flush:
             self.outfile.flush()
+
+    def poll_stat(self):
+        visited = set()
+        timestamp = int(time.time())
+        for proc in psutil.process_iter():
+            try:
+                pinfo = proc.as_dict(attrs=['pid', 'name', 'cmdline'])
+            except psutil.NoSuchProcess:
+                pass
+            else:
+                if pinfo['pid'] not in visited:
+                    if pinfo['pid'] in self.pids:
+                        curr_stat = dict(self.BASE_STAT)
+                        cmdline = ' '.join(pinfo['cmdline'])
+                        self._stat_proc(proc, curr_stat, visited)
+                        self.output_stat(curr_stat, timestamp, cmdline)
+                    else:
+                        for k in self.keywords:
+                            curr_stat = dict(self.BASE_STAT)
+                            cmdline = ' '.join(pinfo['cmdline'])
+                            if k in pinfo['name'] or k in cmdline and all([s not in cmdline for s in self.exclude]):
+                                self._stat_proc(proc, curr_stat, visited)
+                                self.output_stat(curr_stat, timestamp, cmdline)
+
 
 
 def chprio(prio):
@@ -256,23 +265,33 @@ def main():
     parser.add_argument('--delay', '-d', type=int, default=1, help='Interval, in sec, to poll information.')
     parser.add_argument('--flush', '-f', default=False, action='store_true',
                         help='If present, flush the output files after each line is written.')
-    parser.add_argument('--outfile', '-o', type=str, nargs='?', default=None,
-                        required=False, help='Name of system monitor output file. If unset, print to stdout.')
     parser.add_argument('--nic', '-n', type=str, nargs='?', default=None, required=False,
                         help='Specify particular NICs, separated by a comma, to monitor. Default is none.')
     parser.add_argument('--nic-outfile', type=str, nargs='?',
                         default='netstat.{nic}.csv', help='Name of the NIC monitor output file. Use "{nic}" as placeholder for NIC name. Default: "netstat.{nic}.csv".')
+    parser.add_argument('--enable-sm', '-s', default=False,
+                        action='store_true', help='Enable system-wide monitor.')
+    parser.add_argument('--sm-outfile', type=str, nargs='?', default=None, required=False,
+                        help='Name of the process monitor output file. If not set, stdout is used.')
     parser.add_argument('--enable-ps', '-p', default=False,
                         action='store_true', help='Enable process-keyword monitor.')
     parser.add_argument('--ps-keywords', type=str, nargs='*',
                         help='Include processes whose name contains the keyword and their children.')
+    parser.add_argument('--ps-exclude', type=str, nargs='*',
+                        help='Exclude processes whose name contains the keyword and their children.')
     parser.add_argument('--ps-pids', type=int, nargs='*',
                         help='Include the specified PIDs and their children.')
-    parser.add_argument('--ps-outfile', type=str, nargs='?', default='psstat.csv',
-                        help='Name of the process monitor output file. Default: "psstat.csv".')
+    parser.add_argument('--ps-outfile', type=str, nargs='?', default=None,
+                        help='Name of the process monitor output file. If not set, stdout is used.')
     args = parser.parse_args()
     if args.enable_ps and ((not args.ps_keywords or len(args.ps_keywords) == 0) and (not args.ps_pids or len(args.ps_pids) == 0)):
         parser.error('--enable-ps requires --ps-keywords or --ps-pids.')
+
+    if args.enable_ps and args.enable_sm:
+        parser.error('only one of --enable_sm and --enable_ps can be used')
+
+    if not args.enable_ps and not args.enable_sm:
+        parser.error('at least one of --enable_sm and --enable_ps should be used')
 
     if args.ps_pids is None:
         args.ps_pids = set()
@@ -281,16 +300,18 @@ def main():
 
     if args.ps_keywords is None:
         args.ps_keywords = []
-    else:
-        # Convert to lowercase to achieve case IN-sensitiveness.
-        args.ps_keywords = [k.lower() for k in args.ps_keywords]
+    if args.ps_exclude is None:
+        args.ps_exclude = []
+
 
     signal.signal(signal.SIGTERM, sigterm)
 
     try:
         chprio(-20)
         scheduler = sched.scheduler(time.time, time.sleep)
-        sm = SystemMonitor(args.outfile, args.flush)
+
+        if args.enable_sm:
+            sm = SystemMonitor(args.sm_outfile, args.flush)
 
         enable_nic_mon = args.nic is not None
         if enable_nic_mon:
@@ -303,13 +324,15 @@ def main():
 
         if args.enable_ps:
             pm = ProcessSetMonitor(
-                args.ps_keywords, args.ps_pids, args.ps_outfile, args.flush)
+                args.ps_keywords, args.ps_exclude, args.ps_pids, args.ps_outfile, args.flush)
 
         i = 1
         starttime = time.time()
         while True:
-            scheduler.enterabs(
-                time=starttime + i*args.delay, priority=2, action=SystemMonitor.poll_stat, argument=(sm, ))
+            if args.enable_sm:
+                scheduler.enterabs(
+                    time=starttime + i*args.delay, priority=2, action=SystemMonitor.poll_stat, argument=(sm, ))
+
             if enable_nic_mon:
                 scheduler.enterabs(time=starttime + i*args.delay, priority=1,
                                    action=NetworkInterfaceMonitor.poll_stat, argument=(nm, ))
@@ -320,7 +343,8 @@ def main():
             i += 1
 
     except KeyboardInterrupt:
-        sm.close()
+        if args.enable_sm:
+            sm.close()
         if enable_nic_mon:
             nm.close()
         if args.enable_ps:
