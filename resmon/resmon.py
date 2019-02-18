@@ -196,7 +196,8 @@ class ProcessSetMonitor:
         nctxsw = proc.num_ctx_switches()
         nctxsw = nctxsw.voluntary + nctxsw.involuntary
         nthreads = proc.num_threads()
-        cpu_percent = proc.cpu_percent()
+        cpu_percent = proc.cpu_percent(interval=0.01)
+        print(proc.pid, cpu_percent)
         stat['io.read'] += io.read_count
         stat['io.write'] += io.write_count
         stat['io.read.KB'] += io.read_bytes
@@ -235,17 +236,14 @@ class ProcessSetMonitor:
                 if pinfo['pid'] not in visited:
                     if pinfo['pid'] in self.pids:
                         curr_stat = dict(self.BASE_STAT)
-                        cmdline = ' '.join(pinfo['cmdline'])
                         self._stat_proc(proc, curr_stat, visited)
-                        self.output_stat(curr_stat, timestamp, cmdline)
                     else:
                         for k in self.keywords:
-                            curr_stat = dict(self.BASE_STAT)
                             cmdline = ' '.join(pinfo['cmdline'])
                             if k in pinfo['name'] or k in cmdline and all([s not in cmdline for s in self.exclude]):
+                                curr_stat = dict(self.BASE_STAT)
                                 self._stat_proc(proc, curr_stat, visited)
                                 self.output_stat(curr_stat, timestamp, cmdline)
-
 
 
 def chprio(prio):
